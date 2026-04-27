@@ -37,6 +37,8 @@ def update_fused_layer_weight_global_scales(submodule: Module):
         ("q_proj", "k_proj", "v_proj"),
         # DeepSeek multi-latent attention has fused_qkv_a_proj
         ("q_a_proj", "kv_a_proj_with_mqa"),
+        # DeepSeek V4 attention input projections
+        ("wq_a", "wkv"),
     ]
 
     def _is_valid_tensor_group_quant(layer_list: list[Linear]) -> bool:

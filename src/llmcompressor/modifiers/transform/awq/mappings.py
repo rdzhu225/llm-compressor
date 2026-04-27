@@ -170,6 +170,26 @@ _deepseek_mappings = [
     AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
 ]
 
+# DeepseekV4
+_deepseek_v4_mappings = [
+    AWQMapping(
+        "re:.*attn_norm$",
+        ["re:.*attn\\.wq_a$", "re:.*attn\\.wkv$"],
+    ),
+    AWQMapping("re:.*attn\\.q_norm$", ["re:.*attn\\.wq_b$"]),
+    AWQMapping("re:.*attn\\.kv_norm$", ["re:.*attn\\.wkv$"]),
+    AWQMapping(
+        "re:.*ffn_norm$",
+        [
+            "re:.*ffn\\.experts\\..*\\.w1$",
+            "re:.*ffn\\.experts\\..*\\.w3$",
+            "re:.*ffn\\.shared_experts\\.w1$",
+            "re:.*ffn\\.shared_experts\\.w3$",
+        ],
+    ),
+    AWQMapping("re:.*\\.w3$", ["re:.*\\.w2$"]),
+]
+
 _bloom_mappings = [
     AWQMapping("re:.*input_layernorm$", ["re:.*query_key_value$"]),
     AWQMapping("re:.*post_attention_layernorm$", ["re:.*dense_h_to_4h$"]),
@@ -246,6 +266,7 @@ AWQ_MAPPING_REGISTRY: dict[str, list[AWQMapping]] = {
     "Cohere2ForCausalLM": _cohere_mappings,
     "Cohere2VisionForConditionalGeneration": _cohere_mappings,
     "DeepseekV3ForCausalLM": _deepseek_mappings,
+    "DeepseekV4ForCausalLM": _deepseek_v4_mappings,
     "Exaone4ForCausalLM": _exaone4_mappings,
     "Gemma2ForCausalLM": _gemma_mappings,
     "Gemma3ForCausalLM": _gemma_mappings,
