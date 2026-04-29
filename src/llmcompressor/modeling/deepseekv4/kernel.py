@@ -1,126 +1,490 @@
 # This file contains code adapted from the DeepSeek-V4 project.
-# Pure PyTorch replacements for tilelang kernels.
+# Official tilelang kernels from:
+#   https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/kernel.py
 # Copyright (c) 2025 DeepSeek (MIT License)
+
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import tilelang
+import tilelang.language as T
+
+tilelang.set_log_level("WARNING")
+
+pass_configs = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+}
+
+FP8 = "float8_e4m3"
+FP4 = "float4_e2m1fn"
+FE8M0 = "float8_e8m0fnu"
+BF16 = "bfloat16"
+FP32 = "float32"
+INT32 = "int32"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for tilelang kernels
+# ---------------------------------------------------------------------------
+
+def fast_log2_ceil(x):
+    bits_x = T.reinterpret("uint32", x)
+    exp_x = (bits_x >> 23) & 0xFF
+    man_bits = bits_x & ((1 << 23) - 1)
+    return T.Cast("int32", exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0))
+
+
+def fast_pow2(x):
+    bits_x = (x + 127) << 23
+    return T.reinterpret("float32", bits_x)
+
+
+def fast_round_scale(amax, fp8_max_inv):
+    return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
+
+
+# ---------------------------------------------------------------------------
+# act_quant: block-wise FP8 quantization
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(pass_configs=pass_configs)
+def act_quant_kernel(
+    N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32,
+    round_scale=False, inplace=False
+):
+    M = T.symbolic("M")
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1 / fp8_max
+    num_stages = 0 if round_scale or inplace else 2
+    blk_m = 32
+    group_size = block_size
+    compute_dtype = FP32
+    out_dtype = in_dtype if inplace else out_dtype
+
+    @T.prim_func
+    def act_quant_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, N), out_dtype],
+        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
+            pid_m,
+            pid_n,
+        ):
+            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
+            y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
+            y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
+
+            for _ in T.Pipelined(1, num_stages=num_stages):
+                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 1e-4)
+                    if round_scale:
+                        s_local[i] = fast_round_scale(amax_local[i], fp8_max_inv)
+                    else:
+                        s_local[i] = amax_local[i] * fp8_max_inv
+                if inplace:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(
+                            out_dtype,
+                            T.Cast(compute_dtype, T.Cast(out_dtype, T.clamp(
+                                x_local[i, j] / s_local[i], fp8_min, fp8_max
+                            ))) * s_local[i],
+                        )
+                else:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.clamp(
+                            x_local[i, j] / s_local[i], fp8_min, fp8_max
+                        )
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+
+    return act_quant_kernel_
+
+
+def act_quant(
+    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None,
+    scale_dtype: torch.dtype = torch.float32, inplace: bool = False,
+) -> torch.Tensor:
+    N = x.size(-1)
+    assert N % block_size == 0
+    tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
+    z = x.contiguous()
+    y = torch.empty_like(z) if inplace else torch.empty_like(z, dtype=torch.float8_e4m3fn)
+    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=scale_dtype)
+    kernel = act_quant_kernel(
+        N, block_size, scale_dtype=tl_dtype,
+        round_scale=scale_fmt is not None, inplace=inplace,
+    )
+    kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
+    if inplace:
+        x.copy_(y)
+        return x
+    return y, s
+
+
+# ---------------------------------------------------------------------------
+# fp8_gemm: block-wise FP8 matmul
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(pass_configs=pass_configs)
+def fp8_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FP32):
+    M = T.symbolic("M")
+    group_size = 128
+    block_M = 128
+    block_N = 128
+    block_K = 128
+    num_stages = 2
+    threads = 128
+
+    @T.prim_func
+    def fp8_gemm_kernel_(
+        A: T.Tensor[(M, K), FP8],
+        B: T.Tensor[(N, K), FP8],
+        C: T.Tensor[(M, N), out_dtype],
+        scales_a: T.Tensor[(M, T.ceildiv(K, group_size)), scale_dtype],
+        scales_b: T.Tensor[(N, T.ceildiv(K, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (
+            bx,
+            by,
+        ):
+            A_shared = T.alloc_shared((block_M, block_K), FP8)
+            B_shared = T.alloc_shared((block_N, block_K), FP8)
+            C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            C_local_accum = T.alloc_fragment((block_M, block_N), accum_dtype)
+            Scale_C_shared = T.alloc_fragment(block_M, FP32)
+
+            T.clear(C_local_accum)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[bx * block_N, k * block_K], B_shared)
+                Scale_B = T.Cast(FP32, scales_b[bx * block_N // group_size, k])
+                for i in T.Parallel(block_M):
+                    Scale_C_shared[i] = T.Cast(FP32, scales_a[by * block_M + i, k]) * Scale_B
+
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                for i, j in T.Parallel(block_M, block_N):
+                    C_local_accum[i, j] += C_local[i, j] * Scale_C_shared[i]
+                T.clear(C_local)
+            T.copy(C_local_accum, C_shared)
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return fp8_gemm_kernel_
+
+
+def fp8_gemm(
+    a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a_s.is_contiguous() and b_s.is_contiguous()
+    tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    kernel = fp8_gemm_kernel(N, K, scale_dtype=tl_dtype)
+    kernel(a.view(M, K), b, c.view(M, N), a_s.view(M, -1), b_s)
+    return c
+
+
+# ---------------------------------------------------------------------------
+# sparse_attn: tilelang sparse multi-head attention
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(pass_configs=pass_configs)
+def sparse_attn_kernel(h: int, d: int, scale=None):
+    b = T.symbolic("b")
+    m = T.symbolic("m")
+    n = T.symbolic("n")
+    topk = T.symbolic("topk")
+    if scale is None:
+        scale = (1.0 / d) ** 0.5
+
+    num_stages = 2
+    threads = 256
+    block = 64
+    num_blocks = tilelang.cdiv(topk, block)
+
+    @T.prim_func
+    def sparse_attn_kernel_(
+        q: T.Tensor[(b, m, h, d), BF16],
+        kv: T.Tensor[(b, n, d), BF16],
+        o: T.Tensor[(b, m, h, d), BF16],
+        attn_sink: T.Tensor[(h,), FP32],
+        topk_idxs: T.Tensor[(b, m, topk), INT32],
+    ):
+        with T.Kernel(m, b, threads=threads) as (bx, by):
+            q_shared = T.alloc_shared((h, d), BF16)
+            kv_shared = T.alloc_shared((block, d), BF16)
+            o_shared = T.alloc_shared((h, d), BF16)
+            acc_s_cast = T.alloc_shared((h, block), BF16)
+
+            idxs = T.alloc_fragment(block, INT32)
+            acc_s = T.alloc_fragment((h, block), FP32)
+            acc_o = T.alloc_fragment((h, d), FP32)
+            scores_max = T.alloc_fragment(h, FP32)
+            scores_max_prev = T.alloc_fragment(h, FP32)
+            scores_scale = T.alloc_fragment(h, FP32)
+            scores_sum = T.alloc_fragment(h, FP32)
+            sum_exp = T.alloc_fragment(h, FP32)
+
+            T.clear(acc_o)
+            T.clear(sum_exp)
+            T.fill(scores_max, -T.infinity(FP32))
+            T.copy(q[by, bx, :, :], q_shared)
+
+            for t in T.Pipelined(num_blocks, num_stages=num_stages):
+                for i in T.Parallel(block):
+                    idxs[i] = T.if_then_else(t * block + i < topk, topk_idxs[by, bx, t * block + i], -1)
+                for i, j in T.Parallel(block, d):
+                    kv_shared[i, j] = T.if_then_else(idxs[i] != -1, kv[by, idxs[i], j], 0)
+                for i, j in T.Parallel(h, block):
+                    acc_s[i, j] = T.if_then_else(idxs[j] != -1, 0, -T.infinity(FP32))
+                T.gemm(q_shared, kv_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                for i, j in T.Parallel(h, block):
+                    acc_s[i, j] *= scale
+                T.copy(scores_max, scores_max_prev)
+                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                for i in T.Parallel(h):
+                    scores_scale[i] = T.exp(scores_max_prev[i] - scores_max[i])
+                for i, j in T.Parallel(h, block):
+                    acc_s[i, j] = T.exp(acc_s[i, j] - scores_max[i])
+                T.reduce_sum(acc_s, scores_sum, dim=1)
+                for i in T.Parallel(h):
+                    sum_exp[i] = sum_exp[i] * scores_scale[i] + scores_sum[i]
+                T.copy(acc_s, acc_s_cast)
+                for i, j in T.Parallel(h, d):
+                    acc_o[i, j] *= scores_scale[i]
+                T.gemm(acc_s_cast, kv_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            for i in T.Parallel(h):
+                sum_exp[i] += T.exp(attn_sink[i] - scores_max[i])
+            for i, j in T.Parallel(h, d):
+                acc_o[i, j] /= sum_exp[i]
+            T.copy(acc_o, o_shared)
+            T.copy(o_shared, o[by, bx, :, :])
+
+    return sparse_attn_kernel_
+
+
+def sparse_attn(
+    q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor, softmax_scale: float,
+) -> torch.Tensor:
+    b, s, h, d = q.size()
+    if h < 16:
+        q = torch.cat([q, q.new_zeros(b, s, 16 - h, d)], dim=2)
+        attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(16 - h)])
+    o = torch.empty_like(q)
+    kernel = sparse_attn_kernel(q.size(2), d, softmax_scale)
+    kernel(q, kv, o, attn_sink, topk_idxs)
+    if h < 16:
+        o = o.narrow(2, 0, h).contiguous()
+    return o
+
+
+# ---------------------------------------------------------------------------
+# hc_split_sinkhorn: Hyper-Connection mixing
+# ---------------------------------------------------------------------------
+
+@tilelang.jit(pass_configs=pass_configs)
+def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
+    n = T.symbolic("n")
+    mix_hc = (2 + hc) * hc
+    threads = 64
+
+    @T.prim_func
+    def hc_split_sinkhorn_kernel_(
+        mixes: T.Tensor[(n, mix_hc), FP32],
+        hc_scale: T.Tensor[(3,), FP32],
+        hc_base: T.Tensor[(mix_hc,), FP32],
+        pre: T.Tensor[(n, hc), FP32],
+        post: T.Tensor[(n, hc), FP32],
+        comb: T.Tensor[(n, hc, hc), FP32],
+    ):
+        with T.Kernel(n, threads=threads) as i:
+            mixes_shared = T.alloc_shared(mix_hc, FP32)
+            comb_frag = T.alloc_fragment((hc, hc), FP32)
+            T.copy(mixes[i, :], mixes_shared)
+
+            for j in T.Parallel(hc):
+                pre[i, j] = T.sigmoid(mixes_shared[j] * hc_scale[0] + hc_base[j]) + eps
+            for j in T.Parallel(hc):
+                post[i, j] = 2 * T.sigmoid(mixes_shared[j + hc] * hc_scale[1] + hc_base[j + hc])
+            for j, k in T.Parallel(hc, hc):
+                comb_frag[j, k] = mixes_shared[j * hc + k + hc * 2] * hc_scale[2] + hc_base[j * hc + k + hc * 2]
+
+            row_sum = T.alloc_fragment(hc, FP32)
+            col_sum = T.alloc_fragment(hc, FP32)
+
+            row_max = T.alloc_fragment(hc, FP32)
+            T.reduce_max(comb_frag, row_max, dim=1)
+            for j, k in T.Parallel(hc, hc):
+                comb_frag[j, k] = T.exp(comb_frag[j, k] - row_max[j])
+            T.reduce_sum(comb_frag, row_sum, dim=1)
+            for j, k in T.Parallel(hc, hc):
+                comb_frag[j, k] = comb_frag[j, k] / row_sum[j] + eps
+
+            T.reduce_sum(comb_frag, col_sum, dim=0)
+            for j, k in T.Parallel(hc, hc):
+                comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
+
+            for _ in T.serial(sinkhorn_iters - 1):
+                T.reduce_sum(comb_frag, row_sum, dim=1)
+                for j, k in T.Parallel(hc, hc):
+                    comb_frag[j, k] = comb_frag[j, k] / (row_sum[j] + eps)
+                T.reduce_sum(comb_frag, col_sum, dim=0)
+                for j, k in T.Parallel(hc, hc):
+                    comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
+
+            T.copy(comb_frag, comb[i, :, :])
+
+    return hc_split_sinkhorn_kernel_
 
 
 def hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
+    mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor,
+    hc_mult: int = 4, sinkhorn_iters: int = 20, eps: float = 1e-6,
 ):
-    """
-    Split mixes into pre/post/comb and apply Sinkhorn normalization to comb.
-
-    Args:
-        mixes: (b, s, mix_hc) where mix_hc = (2 + hc_mult) * hc_mult
-        hc_scale: (3,) scaling factors for pre, post, comb
-        hc_base: (mix_hc,) bias terms
-        hc_mult: number of hyper-connection copies
-        sinkhorn_iters: number of Sinkhorn iterations
-        eps: numerical stability epsilon
-
-    Returns:
-        pre: (b, s, hc_mult)
-        post: (b, s, hc_mult)
-        comb: (b, s, hc_mult, hc_mult)
-    """
-    hc = hc_mult
-
-    # Split mixes into pre, post, comb sections
-    pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
-    post = 2 * torch.sigmoid(mixes[..., hc:2*hc] * hc_scale[1] + hc_base[hc:2*hc])
-
-    # comb: reshape from flat to (hc, hc) matrix
-    comb_flat = mixes[..., 2*hc:] * hc_scale[2] + hc_base[2*hc:]
-    comb = comb_flat.unflatten(-1, (hc, hc))
-
-    # softmax along last dim + eps
-    comb = F.softmax(comb, dim=-1) + eps
-
-    # Sinkhorn normalization
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-
+    b, s, _ = mixes.size()
+    pre = mixes.new_empty(b, s, hc_mult)
+    post = mixes.new_empty(b, s, hc_mult)
+    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
+    kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
+    kernel(
+        mixes.view(-1, (2 + hc_mult) * hc_mult), hc_scale, hc_base,
+        pre.view(-1, hc_mult), post.view(-1, hc_mult), comb.view(-1, hc_mult, hc_mult),
+    )
     return pre, post, comb
 
+
+# ---------------------------------------------------------------------------
+# bf16_index: pure PyTorch (no tilelang kernel in official repo)
+# ---------------------------------------------------------------------------
 
 def bf16_index(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """
     Compute index scores for sparse attention routing.
-
-    output[b, m, n] = sum_over_h(ReLU(K[b, n, :] * Q[b, m, h, :]))
-
-    Args:
-        q: (b, m, h, d)
-        k: (b, n, d)
-
-    Returns:
-        scores: (b, m, n)
+    scores[b,m,n] = sum_h relu(sum_d Q[b,m,h,d] * K[b,n,d])
     """
-    # (b, m, h, d) * (b, 1, 1, d) -> (b, m, h, d) -> relu -> sum over h
-    # Actually: Q[b,m,h,:] dot K[b,n,:] for each h, then relu, then sum over h
-    # scores[b,m,n] = sum_h relu(sum_d Q[b,m,h,d] * K[b,n,d])
     scores = torch.einsum("bmhd,bnd->bmhn", q, k)
     scores = torch.relu(scores).sum(dim=2)
     return scores
 
 
-def sparse_attn(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
+# ---------------------------------------------------------------------------
+# Dequantization utilities for loading checkpoint weights
+# ---------------------------------------------------------------------------
+
+def dequant_e8m0_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Convert E8M0 scale tensor to float32. E8M0 = 2^(val - 127)."""
+    # E8M0 is stored as uint8 representing the exponent
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.to(torch.float32)
+    # If already float32, return as-is
+    return scale.float()
+
+
+def dequant_fp8_weight(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """Dequantize FP8 (E4M3) weight with per-block E8M0 scale to bf16.
+
+    weight: (out_features, in_features) in float8_e4m3fn
+    scale: (out_features, in_features // block_size) in float8_e8m0fnu or float32
     """
-    Sparse multi-head attention via index gathering.
+    out_f, in_f = weight.shape
+    w = weight.float()
+    s = dequant_e8m0_scale(scale)
+    # Expand scale to match weight shape
+    s = s.repeat_interleave(block_size, dim=1)[:, :in_f]
+    return (w * s).to(torch.bfloat16)
 
-    Args:
-        q: (b, s, h, d)
-        kv: (b, n, d) - KV cache
-        attn_sink: (h,) - learnable attention sink bias per head
-        topk_idxs: (b, s, topk) - indices into kv, -1 means invalid
-        softmax_scale: attention scaling factor
 
-    Returns:
-        o: (b, s, h, d)
+def dequant_fp4_weight(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Dequantize FP4 (packed as I8/uint8) weight with per-block E8M0 scale to bf16.
+
+    weight: (out_features, in_features // 2) in int8 — two FP4 values packed per byte
+    scale: (out_features, in_features // block_size) in float8_e8m0fnu or float32
+
+    FP4 E2M1 encoding (4-bit): sign(1) + exp(2) + mantissa(1)
+    Packed as two FP4 values per int8 byte (low nibble = first, high nibble = second).
     """
-    b, s, h, d = q.size()
-    topk = topk_idxs.size(-1)
+    out_f = weight.shape[0]
+    packed_k = weight.shape[1]
+    in_f = packed_k * 2  # actual K dimension
 
-    # Clamp invalid indices to 0, we'll mask them later
-    valid_mask = topk_idxs >= 0  # (b, s, topk)
-    safe_idxs = topk_idxs.clamp(min=0)
+    # Unpack: low nibble and high nibble
+    w_bytes = weight.to(torch.uint8)
+    lo = (w_bytes & 0x0F).to(torch.int8)
+    hi = ((w_bytes >> 4) & 0x0F).to(torch.int8)
 
-    # Gather KV: (b, s, topk, d)
-    # Expand indices for gathering from kv (b, n, d)
-    gather_idxs = safe_idxs.unsqueeze(-1).expand(-1, -1, -1, d)  # (b, s, topk, d)
-    kv_expanded = kv.unsqueeze(1).expand(-1, s, -1, -1)  # (b, s, n, d)
-    kv_gathered = torch.gather(kv_expanded, 2, gather_idxs)  # (b, s, topk, d)
+    # FP4 E2M1 decode: sign(1) exp(2) man(1)
+    # Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (and negatives)
+    fp4_lut = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ], dtype=torch.float32, device=weight.device)
 
-    # Compute attention scores: (b, s, h, topk)
-    attn = torch.einsum("bshd,bstd->bsht", q, kv_gathered) * softmax_scale
+    lo_val = fp4_lut[lo.long()]
+    hi_val = fp4_lut[hi.long()]
 
-    # Mask invalid positions
-    invalid_mask = ~valid_mask.unsqueeze(2)  # (b, s, 1, topk)
-    attn = attn.masked_fill(invalid_mask, float("-inf"))
+    # Interleave: [lo_0, hi_0, lo_1, hi_1, ...]
+    w_fp32 = torch.stack([lo_val, hi_val], dim=-1).view(out_f, in_f)
 
-    # Add attention sink: extra "position" with learned bias per head
-    # sink_score: (1, 1, h, 1)
-    sink_score = attn_sink.view(1, 1, h, 1)
-    # Concatenate sink score, then softmax, then drop sink column
-    attn_with_sink = torch.cat([attn, sink_score.expand(b, s, -1, -1)], dim=-1)
-    attn_weights = F.softmax(attn_with_sink, dim=-1)
-    attn_weights = attn_weights[..., :topk]  # drop sink column
+    # Apply scale
+    s = dequant_e8m0_scale(scale)
+    s = s.repeat_interleave(block_size, dim=1)[:, :in_f]
+    return (w_fp32 * s).to(torch.bfloat16)
 
-    # Weighted sum: (b, s, h, d)
-    o = torch.einsum("bsht,bstd->bshd", attn_weights, kv_gathered)
-    return o
+
+# ---------------------------------------------------------------------------
+# FP8Linear: nn.Module using tilelang fp8_gemm for FP8 weight layers
+# ---------------------------------------------------------------------------
+
+class FP8Linear(torch.nn.Module):
+    """Linear layer that stores FP8 weights with per-block scales.
+
+    Loads directly from checkpoint FP8 weights (.weight as float8_e4m3fn,
+    .scale as float8_e8m0fnu per-block scales). Forward uses tilelang fp8_gemm.
+    """
+
+    def __init__(self, in_features: int, out_features: int, block_size: int = 128):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        # Weight stored as FP8
+        self.weight = torch.nn.Parameter(
+            torch.empty(out_features, in_features, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        # Per-block weight scales (E8M0 format from checkpoint)
+        n_blocks = (in_features + block_size - 1) // block_size
+        self.scale = torch.nn.Parameter(
+            torch.ones(out_features, n_blocks, dtype=torch.float8_e8m0fnu),
+            requires_grad=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Quantize activation to FP8 with E8M0 scales to match weight scale format
+        x_fp8, x_scale = act_quant(
+            x, block_size=self.block_size,
+            scale_fmt="e8m0", scale_dtype=torch.float8_e8m0fnu,
+        )
+        # FP8 matmul: x_fp8 @ weight^T with block scales
+        return fp8_gemm(
+            x_fp8, x_scale, self.weight, self.scale,
+            scale_dtype=torch.float8_e8m0fnu,
+        )

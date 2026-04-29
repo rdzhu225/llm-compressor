@@ -18,7 +18,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
 from llmcompressor.modeling.deepseekv4.kernel import (
+    FP8Linear,
     bf16_index,
+    dequant_fp4_weight,
+    dequant_fp8_weight,
     hc_split_sinkhorn,
     sparse_attn,
 )
@@ -149,7 +152,7 @@ class Indexer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.compress_ratio = compress_ratio
 
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_b = FP8Linear(self.q_lora_rank, self.n_heads * self.head_dim)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim ** -0.5
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
@@ -222,17 +225,16 @@ class Attention(nn.Module):
         self.eps = config.norm_eps
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
+        self.wq_a = FP8Linear(self.dim, self.q_lora_rank)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
-        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
+        self.wq_b = FP8Linear(self.q_lora_rank, self.n_heads * self.head_dim)
+        self.wkv = FP8Linear(self.dim, self.head_dim)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = nn.Linear(
+        self.wo_a = FP8Linear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * config.o_lora_rank,
-            bias=False,
         )
-        self.wo_b = nn.Linear(self.n_groups * config.o_lora_rank, self.dim, bias=False)
+        self.wo_b = FP8Linear(self.n_groups * config.o_lora_rank, self.dim)
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:
@@ -284,8 +286,10 @@ class Attention(nn.Module):
 
         # Output projection (grouped)
         o = o.view(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        # Dequant wo_a FP8 weight for grouped einsum
+        wo_a_weight = dequant_fp8_weight(self.wo_a.weight, self.wo_a.scale, self.wo_a.block_size)
+        wo_a_weight = wo_a_weight.view(self.n_groups, self.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a_weight)
         x = self.wo_b(o.flatten(2))
         return x
 
@@ -341,6 +345,24 @@ class Expert(nn.Module):
         self.w2 = nn.Linear(inter_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, inter_dim, bias=False)
         self.swiglu_limit = swiglu_limit
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Auto-dequant FP4/FP8 weights during loading."""
+        for name in ("w1", "w2", "w3"):
+            w_key = f"{prefix}{name}.weight"
+            s_key = f"{prefix}{name}.scale"
+            if w_key in state_dict and s_key in state_dict:
+                weight = state_dict[w_key]
+                scale = state_dict[s_key]
+                # FP4 packed as I8: shape is (out, in//2)
+                if weight.dtype in (torch.int8, torch.uint8):
+                    state_dict[w_key] = dequant_fp4_weight(weight, scale)
+                # FP8: shape is (out, in)
+                elif weight.dtype == torch.float8_e4m3fn:
+                    state_dict[w_key] = dequant_fp8_weight(weight, scale)
+                # Remove scale — nn.Linear doesn't have it
+                del state_dict[s_key]
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         dtype = x.dtype
@@ -468,7 +490,7 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     config_class = ModelConfig
     base_model_prefix = ""  # no prefix — checkpoint keys have no "model." prefix
     _no_split_modules = ["Block"]
-    _keys_to_ignore_on_load_unexpected = [r".*\.scale$", r"^mtp\..*"]
+    _keys_to_ignore_on_load_unexpected = [r"^mtp\..*"]
     supports_gradient_checkpointing = False
 
     def _init_weights(self, module):
